@@ -10,8 +10,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -35,6 +37,17 @@ public class Converter {
 	}
 
 	private static final Logger NO_OP_LOGGER = message -> {};
+
+	/** Special version label for the pre-flattening (numeric block id) classic .schematic format. */
+	public static final String LEGACY_LABEL = "1.12.2";
+
+	/** All version labels this tool can target, oldest to newest, starting with {@link #LEGACY_LABEL}. */
+	public static List<String> supportedVersionLabels() {
+		List<String> labels = new ArrayList<>();
+		labels.add(LEGACY_LABEL);
+		labels.addAll(VersionBlocks.labels());
+		return labels;
+	}
 
 	public static List<File> litematicToWorldEdit(File inputFile, File outputDir) throws IOException {
 		return litematicToWorldEdit(inputFile, outputDir, NO_OP_LOGGER);
@@ -376,6 +389,184 @@ public class Converter {
 			result[i] = value;
 		}
 		return result;
+	}
+
+	// Known block renames across versions, both directions. Found by diffing
+	// PrismarineJS/minecraft-data's block lists between consecutive milestones --
+	// renames turn out to be rare (block names are otherwise stable since 1.13).
+	private static final Map<String, String> RENAME_ALIASES = new HashMap<>();
+	static {
+		addAlias("sign", "oak_sign");               // 1.13 -> 1.14, wood types split out
+		addAlias("wall_sign", "oak_wall_sign");      // 1.13 -> 1.14, wood types split out
+		addAlias("grass_path", "dirt_path");         // 1.16 -> 1.17
+		addAlias("grass", "short_grass");            // 1.20, plant renamed
+		addAlias("chain", "iron_chain");             // 1.21, disambiguated from copper chains
+	}
+	private static void addAlias(String a, String b) {
+		RENAME_ALIASES.put(a, b);
+		RENAME_ALIASES.put(b, a);
+	}
+
+	// When a block has no equivalent at all in the target version, try the same
+	// family's most basic variant before giving up and falling back to stone.
+	private static final String[] WOOD_FAMILY_SUFFIXES = {
+		"_planks", "_log", "_wood", "_leaves", "_sapling", "_stairs", "_slab", "_fence",
+		"_fence_gate", "_door", "_trapdoor", "_button", "_pressure_plate", "_sign", "_wall_sign", "_boat"
+	};
+	private static final String[] COLOR_FAMILY_SUFFIXES = {
+		"_wool", "_carpet", "_concrete", "_concrete_powder", "_terracotta", "_stained_glass",
+		"_stained_glass_pane", "_banner", "_wall_banner", "_bed", "_candle", "_glazed_terracotta", "_shulker_box"
+	};
+
+	/**
+	 * Converts a .litematic or .schem file so its blocks target a specific Minecraft
+	 * version. Targeting {@link #LEGACY_LABEL} produces a classic .schematic (delegating
+	 * to {@link #schemToSchematic}); any other label produces a .schem with its palette
+	 * remapped to that version's block set and its DataVersion updated. Blocks with no
+	 * equivalent in the target version fall back to the closest same-family block, or
+	 * stone as a last resort, and are reported through the logger.
+	 */
+	public static List<File> convertToVersion(File inputFile, File outputDir, String targetLabel, Logger logger) throws IOException {
+		String name = inputFile.getName();
+		if (name.endsWith(".litematic")) {
+			File tempDir = Files.createTempDirectory("lite2edit_ver_").toFile();
+			try {
+				List<File> staged = litematicToWorldEdit(inputFile, tempDir, logger);
+				List<File> results = new ArrayList<>();
+				for (File stagedSchem : staged) {
+					results.addAll(convertSchemToVersion(stagedSchem, outputDir, targetLabel, logger));
+					stagedSchem.delete();
+				}
+				return results;
+			} finally {
+				tempDir.delete();
+			}
+		}
+		else if (name.endsWith(".schem")) {
+			return convertSchemToVersion(inputFile, outputDir, targetLabel, logger);
+		}
+		else {
+			logger.log(name + " is not a .litematic or .schem file");
+			return new ArrayList<>();
+		}
+	}
+
+	private static List<File> convertSchemToVersion(File schemFile, File outputDir, String targetLabel, Logger logger) throws IOException {
+		if (targetLabel.equals(LEGACY_LABEL)) {
+			return schemToSchematic(schemFile, outputDir, logger);
+		}
+
+		logger.log("Reading " + schemFile.getName() + "...");
+		DataInputStream inStream = new DataInputStream(new GZIPInputStream(new FileInputStream(schemFile)));
+		CompoundTag wrapper = CompoundTag.read(inStream).asCompound();
+		inStream.close();
+
+		CompoundTag content = null;
+		for (NamedTag t : wrapper) {
+			content = t.asCompound();
+			break;
+		}
+		if (content != null && content.get("Palette").isError() && !content.get("Schematic").isError()) {
+			content = content.get("Schematic").asCompound();
+		}
+		if (content == null || content.get("Palette").isError()) {
+			logger.log(schemFile.getName() + " is not a valid schematic file");
+			return new ArrayList<>();
+		}
+
+		Set<String> targetBlocks = VersionBlocks.blockSet(targetLabel);
+		CompoundTag palette = content.get("Palette").asCompound();
+		CompoundTag newPalette = new CompoundTag();
+		Set<String> unmapped = new LinkedHashSet<>();
+		for (NamedTag entry : palette) {
+			String remapped = remapBlockName(entry.name(), targetBlocks, unmapped);
+			newPalette.add(remapped, entry.getTag());
+		}
+		if (!unmapped.isEmpty()) {
+			logger.log("Warning: " + unmapped.size() + " block type(s) don't exist in " + targetLabel + " and were substituted:");
+			for (String line : unmapped) logger.log("  - " + line);
+		}
+
+		// CompoundTag has no in-place replace, so rebuild it with the updated tags.
+		CompoundTag updatedContent = new CompoundTag();
+		boolean sawDataVersion = false;
+		for (NamedTag t : content) {
+			if (t.name().equals("Palette")) {
+				updatedContent.add("Palette", newPalette);
+			}
+			else if (t.name().equals("DataVersion")) {
+				updatedContent.add("DataVersion", new IntTag(VersionBlocks.dataVersion(targetLabel)));
+				sawDataVersion = true;
+			}
+			else {
+				updatedContent.add(t);
+			}
+		}
+		if (!sawDataVersion) {
+			updatedContent.add("DataVersion", new IntTag(VersionBlocks.dataVersion(targetLabel)));
+		}
+
+		CompoundTag root = new CompoundTag();
+		root.add("Schematic", updatedContent);
+
+		String outputFileName = schemFile.getName();
+		if (outputFileName.contains(".")) {
+			outputFileName = outputFileName.substring(0, outputFileName.lastIndexOf('.'));
+		}
+		// Output is also a .schem, same as the input -- a bare name would collide with (and
+		// silently overwrite) the source file, so the target version is always appended.
+		outputFileName = outputFileName.replaceAll("[^\\w-]+", "_") + "-" + targetLabel.replace('.', '_') + ".schem";
+
+		Files.createDirectories(outputDir.toPath());
+		File outputFile = new File(outputDir + "/" + outputFileName);
+		if (outputFile.getCanonicalFile().equals(schemFile.getCanonicalFile())) {
+			logger.log("Refusing to overwrite source file " + schemFile.getName());
+			return new ArrayList<>();
+		}
+		writeGzippedNbt(root, outputFile);
+		logger.log("Wrote " + outputFile.getName() + " (targeting Minecraft " + targetLabel + ")");
+
+		List<File> files = new ArrayList<>();
+		files.add(outputFile);
+		return files;
+	}
+
+	private static String remapBlockName(String fullName, Set<String> targetBlocks, Set<String> unmapped) {
+		String name = fullName.startsWith("minecraft:") ? fullName.substring(10) : fullName;
+		int bracket = name.indexOf('[');
+		String base = bracket < 0 ? name : name.substring(0, bracket);
+		String propsPart = bracket < 0 ? "" : name.substring(bracket);
+
+		if (targetBlocks.contains(base)) return "minecraft:" + base + propsPart;
+
+		String alias = RENAME_ALIASES.get(base);
+		if (alias != null && targetBlocks.contains(alias)) return "minecraft:" + alias + propsPart;
+
+		String fallback = categoryFallback(base, targetBlocks);
+		if (fallback != null) {
+			unmapped.add(fullName + "  ->  " + fallback);
+			return "minecraft:" + fallback;
+		}
+
+		unmapped.add(fullName + "  ->  stone (no equivalent found)");
+		return "minecraft:stone";
+	}
+
+	private static String categoryFallback(String base, Set<String> targetBlocks) {
+		for (String suffix : WOOD_FAMILY_SUFFIXES) {
+			if (base.endsWith(suffix)) {
+				for (String candidate : new String[] {"oak" + suffix, "stone" + suffix, "cobblestone" + suffix}) {
+					if (targetBlocks.contains(candidate)) return candidate;
+				}
+			}
+		}
+		for (String suffix : COLOR_FAMILY_SUFFIXES) {
+			if (base.endsWith(suffix)) {
+				String candidate = "white" + suffix;
+				if (targetBlocks.contains(candidate)) return candidate;
+			}
+		}
+		return null;
 	}
 
 }

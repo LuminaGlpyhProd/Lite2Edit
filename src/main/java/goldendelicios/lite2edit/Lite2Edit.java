@@ -20,6 +20,7 @@ import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -49,22 +50,35 @@ public class Lite2Edit {
 		if (args.length == 0)
 			openGUI();
 		else if (args[0].equals("--convert")) {
-			File[] files = new File[args.length - 1];
-			for (int i = 1; i < args.length; i++) {
+			int start = 1;
+			String target = Converter.LEGACY_LABEL;
+			if (args.length > 2 && args[1].equals("--target")) {
+				target = args[2];
+				start = 3;
+				if (!Converter.supportedVersionLabels().contains(target)) {
+					System.err.println("Error: unknown --target version '" + target + "'");
+					System.err.println("Supported versions: " + String.join(", ", Converter.supportedVersionLabels()));
+					return;
+				}
+			}
+
+			File[] files = new File[args.length - start];
+			for (int i = start; i < args.length; i++) {
 				String filename = args[i];
 				File file = new File(filename);
 				if (!(isLitematic(filename) || isSchem(filename)) || !file.isFile()) {
 					System.err.println("Error: '" + filename + "' is not a valid .litematic or .schem file");
 					return;
 				}
-				files[i - 1] = file;
+				files[i - start] = file;
 			}
-			convertCli(files);
+			convertCli(files, target);
 		}
 		else {
 			System.err.println("Invalid arguments.");
 			System.err.println("Correct usage: `java -jar Lite2Edit.jar` (Opens GUI)");
-			System.err.println("Correct usage: `java -jar Lite2Edit.jar --convert [Path to file 1] [Path to file 2]...`");
+			System.err.println("Correct usage: `java -jar Lite2Edit.jar --convert [--target <version>] [Path to file 1] [Path to file 2]...`");
+			System.err.println("Supported --target versions: " + String.join(", ", Converter.supportedVersionLabels()));
 		}
 	}
 
@@ -92,8 +106,8 @@ public class Lite2Edit {
 		title.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
 
 		JLabel subtitle = new JLabel(
-			"<html>Convert <b>.litematic</b> → <b>.schem</b>, or <b>.schem</b> → <b>.schematic</b>.<br>"
-			+ "Pick one or more files below — the file type is detected automatically.</html>");
+			"<html>Converts <b>.litematic</b> and <b>.schem</b> files, retargeted to the Minecraft version you pick below.<br>"
+			+ "Pick one or more files below — the source file type is detected automatically.</html>");
 		subtitle.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
 
 		JPanel headerPanel = new JPanel();
@@ -103,12 +117,18 @@ public class Lite2Edit {
 		headerPanel.add(Box.createVerticalStrut(4));
 		headerPanel.add(subtitle);
 
+		JLabel versionLabel = new JLabel("Target version:");
+		JComboBox<String> versionCombo = new JComboBox<>(Converter.supportedVersionLabels().toArray(new String[0]));
+		versionCombo.setSelectedItem(Converter.LEGACY_LABEL);
+
 		JButton browse = new JButton("Browse files...");
 		JButton clearLog = new JButton("Clear log");
 		JButton openOutput = new JButton("Open output folder");
 		openOutput.setEnabled(false);
 
 		JPanel buttonPanel = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 4));
+		buttonPanel.add(versionLabel);
+		buttonPanel.add(versionCombo);
 		buttonPanel.add(browse);
 		buttonPanel.add(clearLog);
 		buttonPanel.add(openOutput);
@@ -165,12 +185,13 @@ public class Lite2Edit {
 			if (value != JFileChooser.APPROVE_OPTION) return;
 
 			File[] inputs = fc.getSelectedFiles();
+			String target = (String) versionCombo.getSelectedItem();
 			browse.setEnabled(false);
 			progressBar.setValue(0);
 			progressBar.setString("0 / " + inputs.length);
 			statusLabel.setText("Status: Working...");
 
-			new ConversionWorker(inputs, logArea, progressBar, statusLabel, browse, openOutput).execute();
+			new ConversionWorker(inputs, target, logArea, progressBar, statusLabel, browse, openOutput).execute();
 		});
 
 		frame.setVisible(true);
@@ -178,6 +199,7 @@ public class Lite2Edit {
 
 	private static final class ConversionWorker extends SwingWorker<Void, String> {
 		private final File[] inputs;
+		private final String target;
 		private final JTextArea logArea;
 		private final JProgressBar progressBar;
 		private final JLabel statusLabel;
@@ -186,8 +208,9 @@ public class Lite2Edit {
 		private int successCount = 0;
 		private int errorCount = 0;
 
-		ConversionWorker(File[] inputs, JTextArea logArea, JProgressBar progressBar, JLabel statusLabel, JButton browse, JButton openOutput) {
+		ConversionWorker(File[] inputs, String target, JTextArea logArea, JProgressBar progressBar, JLabel statusLabel, JButton browse, JButton openOutput) {
 			this.inputs = inputs;
+			this.target = target;
 			this.logArea = logArea;
 			this.progressBar = progressBar;
 			this.statusLabel = statusLabel;
@@ -200,29 +223,13 @@ public class Lite2Edit {
 			Converter.Logger logger = this::publish;
 			for (int i = 0; i < inputs.length; i++) {
 				File input = inputs[i];
-				publish("--- " + input.getName() + " (" + (i + 1) + "/" + inputs.length + ") ---");
+				publish("--- " + input.getName() + " -> " + target + " (" + (i + 1) + "/" + inputs.length + ") ---");
 				long start = System.currentTimeMillis();
 				try {
 					File parent = input.getAbsoluteFile().getParentFile();
 					dir = parent;
 					lastOutputDir = parent;
-					List<File> outputs;
-					if (isLitematic(input.getName())) {
-						outputs = Converter.litematicToWorldEdit(input, parent, logger);
-					}
-					else if (isSchem(input.getName())) {
-						outputs = Converter.schemToSchematic(input, parent, logger);
-					}
-					else {
-						publish(input.getName() + " has an unsupported extension, skipping");
-						errorCount++;
-						int completedSkip = i + 1;
-						SwingUtilities.invokeLater(() -> {
-							progressBar.setValue(completedSkip * 100 / inputs.length);
-							progressBar.setString(completedSkip + " / " + inputs.length);
-						});
-						continue;
-					}
+					List<File> outputs = Converter.convertToVersion(input, parent, target, logger);
 
 					if (outputs.isEmpty()) {
 						publish(input.getName() + " is not a valid file");
@@ -266,17 +273,15 @@ public class Lite2Edit {
 		}
 	}
 
-	private static void convertCli(File[] inputs) {
+	private static void convertCli(File[] inputs, String target) {
 		Converter.Logger logger = System.out::println;
 		int successCount = 0, errorCount = 0;
 		for (int i = 0; i < inputs.length; i++) {
 			File input = inputs[i];
-			System.out.println("--- " + input.getName() + " (" + (i + 1) + "/" + inputs.length + ") ---");
+			System.out.println("--- " + input.getName() + " -> " + target + " (" + (i + 1) + "/" + inputs.length + ") ---");
 			try {
 				File parent = input.getAbsoluteFile().getParentFile();
-				List<File> outputs = isLitematic(input.getName())
-					? Converter.litematicToWorldEdit(input, parent, logger)
-					: Converter.schemToSchematic(input, parent, logger);
+				List<File> outputs = Converter.convertToVersion(input, parent, target, logger);
 
 				if (outputs.isEmpty()) {
 					System.out.println(input.getName() + " is not a valid file");

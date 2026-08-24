@@ -4,7 +4,7 @@
 
   <groupId>Lite2Edit</groupId>
   <artifactId>Lite2Edit</artifactId>
-  <version>1.3.0</version>
+  <version>1.4.0</version>
   <build>
     <plugins>
       <plugin>
