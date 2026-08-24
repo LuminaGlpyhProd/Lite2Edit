@@ -1,31 +1,43 @@
 package goldendelicios.lite2edit;
 
 import java.awt.BorderLayout;
-import java.awt.event.ActionListener;
+import java.awt.Desktop;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.Insets;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.SwingUtilities;
-import javax.swing.border.EmptyBorder;
+import javax.swing.SwingWorker;
+import javax.swing.UIManager;
 import javax.swing.filechooser.FileFilter;
 
 public class Lite2Edit {
-	private static final String LITEMATIC_PREFIX = ".litematic";
+	private static final String LITEMATIC_EXT = ".litematic";
+	private static final String SCHEM_EXT = ".schem";
 	private static File dir = new File(System.getProperty("user.dir"));
+	private static File lastOutputDir;
 	private static PrintStream errorFile;
-	private static ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
 
 	public static void main(String[] args) {
 		try {
@@ -33,7 +45,7 @@ public class Lite2Edit {
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
-		
+
 		if (args.length == 0)
 			openGUI();
 		else if (args[0].equals("--convert")) {
@@ -41,13 +53,13 @@ public class Lite2Edit {
 			for (int i = 1; i < args.length; i++) {
 				String filename = args[i];
 				File file = new File(filename);
-				if (!filename.endsWith(LITEMATIC_PREFIX) || !file.isFile()) {
-					System.err.println("Error: '" + filename + "' is not a valid file");
+				if (!(isLitematic(filename) || isSchem(filename)) || !file.isFile()) {
+					System.err.println("Error: '" + filename + "' is not a valid .litematic or .schem file");
 					return;
 				}
 				files[i - 1] = file;
 			}
-			convert(files);
+			convertCli(files);
 		}
 		else {
 			System.err.println("Invalid arguments.");
@@ -55,104 +67,233 @@ public class Lite2Edit {
 			System.err.println("Correct usage: `java -jar Lite2Edit.jar --convert [Path to file 1] [Path to file 2]...`");
 		}
 	}
-	
+
+	private static boolean isLitematic(String filename) {
+		return filename.endsWith(LITEMATIC_EXT);
+	}
+
+	private static boolean isSchem(String filename) {
+		return filename.endsWith(SCHEM_EXT);
+	}
+
 	private static void openGUI() {
+		try {
+			UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+		} catch (Exception ignored) {}
+
 		JFrame frame = new JFrame("Lite2Edit");
 		frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-		frame.setSize(400, 200);
+		frame.setMinimumSize(new Dimension(480, 380));
+		frame.setSize(560, 460);
 		frame.setLocationRelativeTo(null);
 
-		JPanel panel = new JPanel();
-		JLabel label = new JLabel("Pick 1 or more Litematic files");
+		JLabel title = new JLabel("Lite2Edit");
+		title.setFont(title.getFont().deriveFont(Font.BOLD, 18f));
+		title.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
 
-		JTextArea textArea = new JTextArea(6, 0);
-		textArea.setEditable(false);
-		JScrollPane scrollPane = new JScrollPane(textArea);
-		scrollPane.setBorder(new EmptyBorder(10, 10, 10, 10));
+		JLabel subtitle = new JLabel(
+			"<html>Convert <b>.litematic</b> → <b>.schem</b>, or <b>.schem</b> → <b>.schematic</b>.<br>"
+			+ "Pick one or more files below — the file type is detected automatically.</html>");
+		subtitle.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
 
-		JButton browse = new JButton("Browse");
-		browse.addActionListener(getBrowseListener(textArea, browse));
+		JPanel headerPanel = new JPanel();
+		headerPanel.setLayout(new BoxLayout(headerPanel, BoxLayout.Y_AXIS));
+		headerPanel.setBorder(BorderFactory.createEmptyBorder(12, 14, 8, 14));
+		headerPanel.add(title);
+		headerPanel.add(Box.createVerticalStrut(4));
+		headerPanel.add(subtitle);
 
-		panel.add(label);
-		panel.add(browse);
+		JButton browse = new JButton("Browse files...");
+		JButton clearLog = new JButton("Clear log");
+		JButton openOutput = new JButton("Open output folder");
+		openOutput.setEnabled(false);
 
-		frame.getContentPane().add(BorderLayout.CENTER, panel);
-		frame.getContentPane().add(BorderLayout.SOUTH, scrollPane);
+		JPanel buttonPanel = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 4));
+		buttonPanel.add(browse);
+		buttonPanel.add(clearLog);
+		buttonPanel.add(openOutput);
+
+		JLabel statusLabel = new JLabel("Status: Idle");
+		JProgressBar progressBar = new JProgressBar(0, 100);
+		progressBar.setStringPainted(true);
+
+		JPanel statusPanel = new JPanel(new GridBagLayout());
+		statusPanel.setBorder(BorderFactory.createEmptyBorder(2, 14, 6, 14));
+		GridBagConstraints gbc = new GridBagConstraints();
+		gbc.gridx = 0; gbc.gridy = 0; gbc.anchor = GridBagConstraints.WEST; gbc.insets = new Insets(0, 0, 4, 0);
+		statusPanel.add(statusLabel, gbc);
+		gbc.gridy = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1;
+		statusPanel.add(progressBar, gbc);
+
+		JTextArea logArea = new JTextArea();
+		logArea.setEditable(false);
+		logArea.setLineWrap(true);
+		logArea.setWrapStyleWord(true);
+		logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+		JScrollPane logScroll = new JScrollPane(logArea);
+		logScroll.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createEmptyBorder(0, 14, 12, 14),
+			BorderFactory.createTitledBorder("Log")));
+
+		JPanel topPanel = new JPanel(new BorderLayout());
+		topPanel.add(headerPanel, BorderLayout.NORTH);
+		topPanel.add(buttonPanel, BorderLayout.CENTER);
+		topPanel.add(statusPanel, BorderLayout.SOUTH);
+
+		frame.getContentPane().add(BorderLayout.NORTH, topPanel);
+		frame.getContentPane().add(BorderLayout.CENTER, logScroll);
+
+		appendLog(logArea, "Ready. Choose files to begin.");
+
+		clearLog.addActionListener(e -> logArea.setText(""));
+		openOutput.addActionListener(e -> {
+			if (lastOutputDir != null && lastOutputDir.isDirectory()) {
+				try {
+					Desktop.getDesktop().open(lastOutputDir);
+				} catch (IOException ex) {
+					appendLog(logArea, "Could not open output folder: " + ex.getMessage());
+				}
+			}
+		});
+
+		browse.addActionListener(event -> {
+			JFileChooser fc = new JFileChooser(dir);
+			fc.setMultiSelectionEnabled(true);
+			fc.setFileFilter(new ConvertibleFileFilter());
+
+			int value = fc.showOpenDialog(frame);
+			if (value != JFileChooser.APPROVE_OPTION) return;
+
+			File[] inputs = fc.getSelectedFiles();
+			browse.setEnabled(false);
+			progressBar.setValue(0);
+			progressBar.setString("0 / " + inputs.length);
+			statusLabel.setText("Status: Working...");
+
+			new ConversionWorker(inputs, logArea, progressBar, statusLabel, browse, openOutput).execute();
+		});
+
 		frame.setVisible(true);
 	}
 
-	private static ActionListener getBrowseListener(JTextArea textArea, JButton browse) {
-		return event -> {
-			JFileChooser fc = new JFileChooser(dir);
-			fc.setMultiSelectionEnabled(true);
-			fc.setFileFilter(new LitematicFileFilter());
-			
-			int value = fc.showOpenDialog(browse);
-			if (value == JFileChooser.APPROVE_OPTION) {
-				File[] inputs = fc.getSelectedFiles();
-				browse.setEnabled(false);
-				scheduler.execute(() -> {
-					StringBuilder s = new StringBuilder();
-					for (int i = 0; i < inputs.length; i++) {
-						String working = "Working... (" + i + "/" + inputs.length + " complete)";
-						SwingUtilities.invokeLater(() -> textArea.setText(working));
-						
-						long start = System.currentTimeMillis();
-						File input = inputs[i];
-						try {
-							File parent = input.getAbsoluteFile().getParentFile();
-							dir = parent;
-							List<File> outputs = Converter.litematicToWorldEdit(input, parent);
-							
-							if (outputs.isEmpty()) {
-								s.append(input.getName() + " is not a valid litematic file\n");
-							}
-							else {
-								for (File output : outputs) {
-									s.append("Exported to " + output.getName() + "\n");
-								}
-							}
-							long time = System.currentTimeMillis() - start;
-							System.out.println("Conversion took " + time + "ms");
-						} catch (Throwable e) {
-							s.append("Error while converting " + input.getName() + ":\n" + e + "\n");
-							handleException(e);
-						}
+	private static final class ConversionWorker extends SwingWorker<Void, String> {
+		private final File[] inputs;
+		private final JTextArea logArea;
+		private final JProgressBar progressBar;
+		private final JLabel statusLabel;
+		private final JButton browse;
+		private final JButton openOutput;
+		private int successCount = 0;
+		private int errorCount = 0;
+
+		ConversionWorker(File[] inputs, JTextArea logArea, JProgressBar progressBar, JLabel statusLabel, JButton browse, JButton openOutput) {
+			this.inputs = inputs;
+			this.logArea = logArea;
+			this.progressBar = progressBar;
+			this.statusLabel = statusLabel;
+			this.browse = browse;
+			this.openOutput = openOutput;
+		}
+
+		@Override
+		protected Void doInBackground() {
+			Converter.Logger logger = this::publish;
+			for (int i = 0; i < inputs.length; i++) {
+				File input = inputs[i];
+				publish("--- " + input.getName() + " (" + (i + 1) + "/" + inputs.length + ") ---");
+				long start = System.currentTimeMillis();
+				try {
+					File parent = input.getAbsoluteFile().getParentFile();
+					dir = parent;
+					lastOutputDir = parent;
+					List<File> outputs;
+					if (isLitematic(input.getName())) {
+						outputs = Converter.litematicToWorldEdit(input, parent, logger);
 					}
-					SwingUtilities.invokeLater(() -> {
-						textArea.setText(s.toString());
-						browse.setEnabled(true);
-					});
+					else if (isSchem(input.getName())) {
+						outputs = Converter.schemToSchematic(input, parent, logger);
+					}
+					else {
+						publish(input.getName() + " has an unsupported extension, skipping");
+						errorCount++;
+						int completedSkip = i + 1;
+						SwingUtilities.invokeLater(() -> {
+							progressBar.setValue(completedSkip * 100 / inputs.length);
+							progressBar.setString(completedSkip + " / " + inputs.length);
+						});
+						continue;
+					}
+
+					if (outputs.isEmpty()) {
+						publish(input.getName() + " is not a valid file");
+						errorCount++;
+					}
+					else {
+						successCount++;
+					}
+					long time = System.currentTimeMillis() - start;
+					publish("Done in " + time + "ms");
+				} catch (Throwable e) {
+					publish("Error while converting " + input.getName() + ": " + e);
+					handleException(e);
+					errorCount++;
+				}
+				int completed = i + 1;
+				SwingUtilities.invokeLater(() -> {
+					progressBar.setValue(completed * 100 / inputs.length);
+					progressBar.setString(completed + " / " + inputs.length);
 				});
 			}
-		};
-	}
-	
-	private static void convert(File[] inputs) {
-		for (int i = 0; i < inputs.length; i++) {
-			String working = "Working... (" + i + "/" + inputs.length + " complete)";
-			System.out.println(working);
-			
-			File input = inputs[i];
-			try {
-				File parent = input.getAbsoluteFile().getParentFile();
-				List<File> outputs = Converter.litematicToWorldEdit(input, parent);
-				
-				if (outputs.isEmpty()) {
-					System.out.print(input.getName() + " is not a valid litematic file\n");
-				}
-				else {
-					for (File output : outputs) {
-						System.out.print("Exported to " + output.getName() + "\n");
-					}
-				}
-			} catch (Throwable e) {
-				System.out.print("Error while converting " + input.getName() + ":\n" + e + "\n");
-				handleException(e);
-			}
+			return null;
+		}
+
+		@Override
+		protected void process(List<String> chunks) {
+			for (String line : chunks) appendLog(logArea, line);
+		}
+
+		@Override
+		protected void done() {
+			progressBar.setValue(100);
+			progressBar.setString(successCount + " / " + inputs.length + " succeeded");
+			String summary = errorCount == 0
+				? "Status: Done — " + successCount + " file(s) converted"
+				: "Status: Done with " + errorCount + " error(s) — " + successCount + " succeeded";
+			statusLabel.setText(summary);
+			appendLog(logArea, summary);
+			browse.setEnabled(true);
+			openOutput.setEnabled(lastOutputDir != null);
 		}
 	}
-	
+
+	private static void convertCli(File[] inputs) {
+		Converter.Logger logger = System.out::println;
+		int successCount = 0, errorCount = 0;
+		for (int i = 0; i < inputs.length; i++) {
+			File input = inputs[i];
+			System.out.println("--- " + input.getName() + " (" + (i + 1) + "/" + inputs.length + ") ---");
+			try {
+				File parent = input.getAbsoluteFile().getParentFile();
+				List<File> outputs = isLitematic(input.getName())
+					? Converter.litematicToWorldEdit(input, parent, logger)
+					: Converter.schemToSchematic(input, parent, logger);
+
+				if (outputs.isEmpty()) {
+					System.out.println(input.getName() + " is not a valid file");
+					errorCount++;
+				}
+				else {
+					successCount++;
+				}
+			} catch (Throwable e) {
+				System.out.println("Error while converting " + input.getName() + ": " + e);
+				handleException(e);
+				errorCount++;
+			}
+		}
+		System.out.println("Finished: " + successCount + " succeeded, " + errorCount + " failed");
+	}
+
 	private static void handleException(Throwable e) {
 		e.printStackTrace();
 		if (errorFile == null) {
@@ -167,16 +308,27 @@ public class Lite2Edit {
 		e.printStackTrace(errorFile);
 		errorFile.flush();
 	}
-	
-	private static final class LitematicFileFilter extends FileFilter {
+
+	private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss");
+
+	private static void appendLog(JTextArea area, String message) {
+		Runnable r = () -> {
+			area.append("[" + TIME_FORMAT.format(new Date()) + "] " + message + "\n");
+			area.setCaretPosition(area.getDocument().getLength());
+		};
+		if (SwingUtilities.isEventDispatchThread()) r.run();
+		else SwingUtilities.invokeLater(r);
+	}
+
+	private static final class ConvertibleFileFilter extends FileFilter {
 		@Override
 		public String getDescription() {
-			return "Litematics (*.litematic)";
+			return "Litematics and Schematics (*.litematic, *.schem)";
 		}
-		
+
 		@Override
 		public boolean accept(File f) {
-			return f.isDirectory() || f.getName().endsWith(LITEMATIC_PREFIX);
+			return f.isDirectory() || isLitematic(f.getName()) || isSchem(f.getName());
 		}
 	}
 
